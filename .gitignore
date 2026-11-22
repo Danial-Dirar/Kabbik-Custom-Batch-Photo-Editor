@@ -1,0 +1,6 @@
+output/
+assets/big-lama.pt
+Current Task/
+__pycache__/
+*.pyc
+.venv/
