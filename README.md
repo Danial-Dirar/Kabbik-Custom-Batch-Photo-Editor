@@ -73,6 +73,29 @@ summary counts them — if too many show up, raise `--budget` rather than ship m
 | `--inpaint` | `auto` | `auto`, `lama`, or `telea` |
 | `--keep-logo` | off | skip detection, only re-encode |
 | `--dry-run` | off | report what would be detected, write nothing |
+| `--status` | off | report how the run writing to `--out` is doing, then exit |
+
+## Watching a run
+
+Each processed file prints its own line, prefixed with the percentage done. A long batch owns
+the terminal though, so the run also mirrors its counters to `<out>/.kabbik-run.json` after
+every file. From anywhere else — another terminal, or after the fact:
+
+```bash
+python kabbik_batch.py --status -o output
+```
+
+```
+Current Task -> output
+ 46.9% █████████████░░░░░░░░░░░░░░░ 90/192   running
+  elapsed 3m40s · 2.4s per file · eta 4m05s
+  logos removed 24 · over budget 0 · detail dropped 3 · 7.8 MB written
+  now: Kabbik Gallery/Uploded Done/.../kobori_push-notification_2048x1024_2x1.png
+```
+
+It reports `finished … ago, took …` once the run is done, and `STALLED` if the run stopped
+without finishing. Writing the file never fails the run — if it cannot be written, the batch
+carries on regardless.
 
 `python test_detect.py` composites the real logo onto synthetic posters and checks the finder
 puts it back where it was put, keeps disc-only apart from the full lockup, covers every logo

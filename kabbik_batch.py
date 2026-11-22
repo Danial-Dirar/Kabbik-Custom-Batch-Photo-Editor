@@ -11,8 +11,10 @@ still lands under the byte budget.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -473,6 +475,93 @@ def fit_webp(img: Image.Image, budget: int, q_min: int = 0, q_max: int = 95
     return _encode(cur, q_min), q_min, detail
 
 
+# --- Progress ------------------------------------------------------------------------
+
+STATE_FILE = ".kabbik-run.json"
+STALE_AFTER = 120          # seconds of silence before a run is called stalled
+
+
+def _hms(sec: float) -> str:
+    sec = int(max(0, sec))
+    if sec >= 3600:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    if sec >= 60:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec}s"
+
+
+class RunState:
+    """Progress, mirrored to <out>/.kabbik-run.json after every file.
+
+    A long batch is otherwise opaque: the run owns the terminal, and anyone else wanting to
+    know how far it got has to count files. With this, `--status` reads the same numbers from
+    anywhere, during the run or after it."""
+
+    def __init__(self, path: Path, src: Path, out: Path, total: int):
+        self.path = path
+        self.d = {"src": str(src), "out": str(out), "total": total, "done": 0,
+                  "logos": 0, "over_budget": 0, "softened": 0, "bytes": 0,
+                  "started": time.time(), "updated": time.time(),
+                  "finished": None, "current": None}
+
+    def save(self) -> None:
+        self.d["updated"] = time.time()
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:                                    # reporting must never break the run
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(self.d), encoding="utf8")
+            tmp.replace(self.path)
+        except OSError:
+            pass
+
+    def finish(self) -> None:
+        self.d["current"] = None
+        self.d["finished"] = time.time()
+        self.save()
+
+
+def _bar(frac: float, width: int = 28) -> str:
+    n = max(0, min(width, int(round(frac * width))))
+    return "█" * n + "░" * (width - n)
+
+
+def show_status(out: Path) -> int:
+    path = out / STATE_FILE
+    if not path.exists():
+        print(f"no run recorded in {out}/ -- nothing has been written there yet")
+        return 1
+    try:
+        d = json.loads(path.read_text(encoding="utf8"))
+    except (OSError, ValueError) as e:
+        print(f"cannot read {path}: {e}")
+        return 1
+
+    done, total = d["done"], max(1, d["total"])
+    frac = done / total
+    elapsed = (d["finished"] or d["updated"]) - d["started"]
+    if d["finished"]:
+        state = f"finished {_hms(time.time() - d['finished'])} ago, took {_hms(elapsed)}"
+    elif time.time() - d["updated"] > STALE_AFTER:
+        state = f"STALLED -- nothing for {_hms(time.time() - d['updated'])}"
+    else:
+        state = "running"
+
+    print(f"{d['src']} -> {d['out']}")
+    print(f"{frac * 100:5.1f}% {_bar(frac)} {done}/{total}   {state}")
+    per = elapsed / done if done else 0
+    line = f"  elapsed {_hms(elapsed)}"
+    if per:
+        line += f" · {per:.1f}s per file"
+        if not d["finished"]:
+            line += f" · eta {_hms(per * (total - done))}"
+    print(line)
+    print(f"  logos removed {d['logos']} · over budget {d['over_budget']} ·"
+          f" detail dropped {d['softened']} · {d['bytes'] / 1048576:.1f} MB written")
+    if d["current"]:
+        print(f"  now: {d['current']}")
+    return 0
+
+
 # --- Driver --------------------------------------------------------------------------
 
 def iter_images(root: Path):
@@ -484,14 +573,20 @@ def iter_images(root: Path):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("src", type=Path, help="folder to scan (recursively)")
+    ap.add_argument("src", type=Path, nargs="?", help="folder to scan (recursively)")
     ap.add_argument("-o", "--out", type=Path, default=Path("output"))
     ap.add_argument("--budget", type=int, default=100 * 1024, help="max bytes per file")
     ap.add_argument("--inpaint", choices=["auto", "lama", "telea"], default="auto")
     ap.add_argument("--keep-logo", action="store_true", help="skip stage 1, only re-encode")
     ap.add_argument("--dry-run", action="store_true", help="report detections, write nothing")
+    ap.add_argument("--status", action="store_true",
+                    help="report how the run writing to --out is doing, and exit")
     a = ap.parse_args(argv)
 
+    if a.status:
+        return show_status(a.out)
+    if a.src is None:
+        ap.error("src is required (or pass --status to check a run)")
     if not a.src.is_dir():
         print(f"not a folder: {a.src}", file=sys.stderr)
         return 2
@@ -502,9 +597,17 @@ def main(argv=None) -> int:
         print(f"inpaint backend: {inpaint.name} ({inpaint.device})")
 
     files = list(iter_images(a.src))
+    total = len(files)
     found = over = 0
     softened: list[tuple[str, float]] = []
+    state = None if a.dry_run else RunState(a.out / STATE_FILE, a.src, a.out, total)
+    if state:
+        state.save()
     for i, src in enumerate(files, 1):
+        pct = f"{i / max(1, total) * 100:4.0f}%"
+        if state:
+            state.d["current"] = str(src.relative_to(a.src))
+            state.save()
         rgb = np.array(Image.open(src).convert("RGB"))
         hit = None if a.keep_logo else finder.find(rgb)
         if hit:
@@ -513,7 +616,7 @@ def main(argv=None) -> int:
                 rgb = erase_logo(rgb, hit, finder, inpaint)
         if a.dry_run:
             tag = (f"logo s={hit.scale:.2f} text={int(hit.has_text)}" if hit else "no logo")
-            print(f"[{i}/{len(files)}] {tag}  {src.relative_to(a.src)}")
+            print(f"[{pct} {i}/{total}] {tag}  {src.relative_to(a.src)}")
             continue
 
         data, q, detail = fit_webp(Image.fromarray(rgb), a.budget)
@@ -524,13 +627,18 @@ def main(argv=None) -> int:
             over += 1
         if detail < 1.0:
             softened.append((str(dst.relative_to(a.out)), detail))
-        print(f"[{i}/{len(files)}] {len(data)/1024:6.1f}KB q={q:2d} {rgb.shape[1]}x{rgb.shape[0]}"
+        print(f"[{pct} {i}/{total}] {len(data)/1024:6.1f}KB q={q:2d}"
+              f" {rgb.shape[1]}x{rgb.shape[0]}"
               f" {'detail %3d%%' % round(detail * 100) if detail < 1.0 else '          '}"
               f" {'logo-removed' if hit else '           -'}  {dst.relative_to(a.out)}")
+        state.d.update(done=i, logos=found, over_budget=over, softened=len(softened))
+        state.d["bytes"] += len(data)
+        state.save()
 
     if a.dry_run:
-        print(f"\n{len(files)} files, logo found in {found}")
+        print(f"\n{total} files, logo found in {found}")
         return 0
+    state.finish()
 
     print(f"\n{len(files)} files, logo found in {found}, {over} over budget, "
           f"{len(softened)} needed detail dropped to fit")
