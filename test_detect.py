@@ -67,7 +67,7 @@ def main():
     if hit is None:
         check("mask covers the logo", False, "nothing detected")
     else:
-        mask = f.logo_mask(img.shape[:2], hit, hit.has_text)
+        mask = f.logo_mask(img, hit, hit.has_text)
         changed = (np.abs(img.astype(int) - img_bg.astype(int)).max(axis=2) > 10)
         missed = int((changed & (mask == 0)).sum())
         check("mask covers the logo", missed == 0, f"{missed} logo px left outside the mask")

@@ -39,6 +39,11 @@ MIN_DISC_MAGENTA = 0.40
 MIN_TEXT_CORR = 0.14         # bgdiff correlation that says the wordmark is there
 SCALE_LO, SCALE_HI, SCALE_STEP = 0.42, 1.30, 0.0125
 MASK_GROW = 11               # canonical px added around the alpha, to catch the drop shadow
+COLOUR_GROW = 6              # canonical px of reach when sweeping up logo-coloured leftovers
+LAMA_WINDOW_PAD = 1.5        # window around the hole, as a multiple of the hole's size
+LAMA_SIDE = 512              # and the longest side that window is scaled to for the model
+BAD_DETAIL = 0.5             # below this, say out loud that the budget cost real quality
+LEFTOVER_CONTRAST = 55       # local-background difference that marks a stray logo pixel
 LOCKUP_SPREAD = 1.06         # small second stamp, after the refine fit
 
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -59,6 +64,62 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
     b = b - b.mean()
     d = np.sqrt((a * a).sum()) * np.sqrt((b * b).sum())
     return float((a * b).sum() / d) if d else 0.0
+
+
+# (hue_lo, hue_hi, min saturation, min value) for the logo's magenta disc and orange bubbles.
+# Floors sit below what the asset itself measures, because the logo's anti-aliased rim blends
+# with the poster behind it and comes out darker and less saturated than the solid artwork.
+# Only ever applied in a thin ring hugging the mask, so over-reaching costs a few pixels of
+# background that were about to be repainted anyway, while under-reaching leaves a bright speck.
+BRAND_COLOUR = ((128, 180, 100, 50), (0, 30, 110, 80))
+
+
+def brand_coloured(rgb: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
+    out = np.zeros(h.shape, bool)
+    for lo, hi, smin, vmin in BRAND_COLOUR:
+        out |= (h > lo) & (h < hi) & (s > smin) & (v > vmin)
+    return out
+
+
+def _grow_into_leftovers(mask: np.ndarray, rgb: np.ndarray, reach: int) -> np.ndarray:
+    """Pull the logo's last few pixels in from just outside the mask.
+
+    The stamp is a rigid shape fitted to a logo that was scaled and re-saved by hand, so its
+    outermost edge can sit a pixel or two beyond -- the rim of a bubble, the tail of a glyph.
+    Two signatures catch those: the brand's own magenta and orange, and, for the white
+    wordmark, anything standing far off its local background. Both are taken only inside a
+    thin ring hugging the mask, and only as small blobs, so an adjacent leaf or wall is left
+    alone while a three-pixel speck is not."""
+    if reach < 1:
+        return mask
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return mask
+    H, W = mask.shape
+    m = 4 * reach + 8                                 # work in a window around the mask
+    x0, y0 = max(0, xs.min() - m), max(0, ys.min() - m)
+    x1, y1 = min(W, xs.max() + 1 + m), min(H, ys.max() + 1 + m)
+    sub, win = rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1].copy()
+    standout = _bgdiff(sub) > LEFTOVER_CONTRAST
+    candidate = brand_coloured(sub) | standout
+    kernel = np.ones((2 * reach + 1,) * 2, np.uint8)
+    limit = max(24, int(0.004 * (mask > 0).sum()))
+    for _ in range(4):          # repeat: absorbing a sliver can expose the next one past it
+        ring = cv2.dilate(win, kernel) & ~win
+        add = ((ring > 0) & candidate).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(add, 8)
+        keep = np.zeros_like(add)
+        for j in range(1, n):
+            if st[j, cv2.CC_STAT_AREA] <= limit:      # a speck, not the background itself
+                keep[lab == j] = 255
+        if not keep.any():
+            break
+        win = np.maximum(win, cv2.dilate(keep, np.ones((5, 5), np.uint8)))
+    out = mask.copy()
+    out[y0:y1, x0:x1] = win
+    return out
 
 
 @dataclass
@@ -131,14 +192,14 @@ class LogoFinder:
         return (int(round(cx - r)), int(round(ccy - r)),
                 int(round(cx + r)), int(round(ccy + r)))
 
-    def logo_mask(self, shape, hit: "Hit", with_text: bool) -> np.ndarray:
+    def logo_mask(self, rgb: np.ndarray, hit: "Hit", with_text: bool) -> np.ndarray:
         """The logo's own alpha, grown a little, placed where it sits in the image.
 
         A few posters use a lockup whose wordmark is set wider against the same disc, so the
         alpha is stamped twice -- at the fitted scale and at LOCKUP_SPREAD times it, both
         pivoting on the disc centre -- and the two are unioned. The disc lands in the same
         place either way; the extra reach only shows up out along the wordmark."""
-        H, W = shape
+        H, W = rgb.shape[:2]
         cx, cy = (self.disc[0] + self.disc[2]) / 2.0, (self.disc[1] + self.disc[3]) / 2.0
         mask = np.zeros((H, W), np.uint8)
 
@@ -162,7 +223,8 @@ class LogoFinder:
         if with_text:
             s, ox, oy = hit.wordmark or (hit.scale, hit.ox, hit.oy)
             stamp(self.alpha, s, ox, oy)                               # wordmark: refined fit
-        return mask
+        return _grow_into_leftovers(mask, rgb, int(round(COLOUR_GROW * hit.scale)))
+
 
     def find(self, rgb: np.ndarray) -> Hit | None:
         H, W = rgb.shape[:2]
@@ -298,6 +360,33 @@ class Inpainter:
         if self.model is None:
             bgr = cv2.inpaint(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, 7, cv2.INPAINT_TELEA)
             return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            return rgb
+        # Run on a window around the hole, scaled to about what LaMa was trained on. Handed a
+        # 1535px poster at full size it leaves little invented bright blobs in the fill; with
+        # the hole at a sane share of a ~512px frame it does not. Also far quicker.
+        H, W = rgb.shape[:2]
+        pad = int(max(64, LAMA_WINDOW_PAD * max(xs.max() - xs.min(), ys.max() - ys.min())))
+        x0, y0 = max(0, xs.min() - pad), max(0, ys.min() - pad)
+        x1, y1 = min(W, xs.max() + 1 + pad), min(H, ys.max() + 1 + pad)
+        sub, sm = rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+        side = max(sub.shape[:2])
+        if side > LAMA_SIDE:
+            f = LAMA_SIDE / side
+            dw, dh = max(8, int(sub.shape[1] * f)), max(8, int(sub.shape[0] * f))
+            patch = self._lama(cv2.resize(sub, (dw, dh), interpolation=cv2.INTER_AREA),
+                               cv2.resize(sm, (dw, dh), interpolation=cv2.INTER_NEAREST))
+            patch = cv2.resize(patch, (sub.shape[1], sub.shape[0]), interpolation=cv2.INTER_CUBIC)
+        else:
+            patch = self._lama(sub, sm)
+        patch = _despeckle(patch, sm)
+        out = rgb.copy()
+        sel = sm > 0
+        out[y0:y1, x0:x1][sel] = patch[sel]          # keep every untouched pixel bit-exact
+        return out
+
+    def _lama(self, rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
         torch = self.torch
         H, W = rgb.shape[:2]
         ph, pw = (8 - H % 8) % 8, (8 - W % 8) % 8          # LaMa needs multiples of 8
@@ -312,8 +401,37 @@ class Inpainter:
         return out[:H, :W]
 
 
+def _despeckle(patch: np.ndarray, mask: np.ndarray,
+               deviation: int = 26, max_area_frac: float = 0.015) -> np.ndarray:
+    """Flatten small bright/dark blobs the inpainter invented inside the hole.
+
+    LaMa occasionally drops a speck into an otherwise plain fill -- a bright dot in a night
+    sky, a pale smudge on a dark wall. Everything inside the mask is invented anyway, so a
+    blob that disagrees sharply with its own surroundings is replaced by them. Bounded to
+    small blobs, so larger reconstructed structure is left alone, and to the mask interior,
+    so the seam with the real photo is untouched."""
+    inner = cv2.erode(mask, np.ones((5, 5), np.uint8))
+    if not inner.any():
+        return patch
+    med = cv2.medianBlur(patch, 15)
+    off = np.abs(patch.astype(np.int16) - med.astype(np.int16)).max(axis=2)
+    bad = ((inner > 0) & (off > deviation)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bad, 8)
+    limit = max(36, int(max_area_frac * (mask > 0).sum()))
+    keep = np.zeros(bad.shape, np.uint8)
+    for j in range(1, n):
+        if st[j, cv2.CC_STAT_AREA] <= limit:
+            keep[lab == j] = 1
+    if not keep.any():
+        return patch
+    keep = cv2.dilate(keep, np.ones((5, 5), np.uint8)) > 0
+    out = patch.copy()
+    out[keep] = med[keep]
+    return out
+
+
 def erase_logo(rgb: np.ndarray, hit: Hit, finder: LogoFinder, inpaint: Inpainter) -> np.ndarray:
-    return inpaint(rgb, finder.logo_mask(rgb.shape[:2], hit, hit.has_text))
+    return inpaint(rgb, finder.logo_mask(rgb, hit, hit.has_text))
 
 
 # --- WebP under a byte budget --------------------------------------------------------
@@ -324,28 +442,35 @@ def _encode(img: Image.Image, quality: int) -> bytes:
     return buf.getvalue()
 
 
-def fit_webp(img: Image.Image, budget: int, q_min: int = 30, q_max: int = 95
-             ) -> tuple[bytes, int, tuple[int, int]]:
-    """Largest quality (then largest scale) that still encodes under `budget` bytes."""
-    scale = 1.0
-    for _ in range(12):
-        cur = img if scale == 1.0 else img.resize(
-            (max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
-        best = None
-        lo, hi = q_min, q_max
+def fit_webp(img: Image.Image, budget: int, q_min: int = 0, q_max: int = 95
+             ) -> tuple[bytes, int, float]:
+    """Highest WebP quality that still encodes under `budget` bytes.
+
+    Pixel dimensions are never changed -- the posters are cut to fixed sizes and have to stay
+    that way. Quality is tried first. A 3840x2160 banner cannot reach 100 KB on quality alone
+    (even q=1 lands around 250 KB), so past that point detail is dropped instead: the image is
+    scaled down and back up to its original size, which softens it while keeping the
+    dimensions. Returns the detail factor so the caller can report it."""
+    def best_quality(im):
+        best, lo, hi = None, q_min, q_max
         while lo <= hi:                                   # binary search on quality
             mid = (lo + hi) // 2
-            data = _encode(cur, mid)
+            data = _encode(im, mid)
             if len(data) < budget:
-                best = (data, mid)
-                lo = mid + 1
+                best, lo = (data, mid), mid + 1
             else:
                 hi = mid - 1
-        if best is not None:
-            return best[0], best[1], cur.size
-        scale *= 0.85                                     # even q_min overflows -> shrink
-    data = _encode(cur, q_min)
-    return data, q_min, cur.size
+        return best
+
+    detail, cur = 1.0, img
+    for _ in range(22):
+        got = best_quality(cur)
+        if got is not None:
+            return got[0], got[1], detail
+        detail *= 0.85
+        w, h = max(16, int(img.width * detail)), max(16, int(img.height * detail))
+        cur = img.resize((w, h), Image.LANCZOS).resize(img.size, Image.LANCZOS)
+    return _encode(cur, q_min), q_min, detail
 
 
 # --- Driver --------------------------------------------------------------------------
@@ -378,6 +503,7 @@ def main(argv=None) -> int:
 
     files = list(iter_images(a.src))
     found = over = 0
+    softened: list[tuple[str, float]] = []
     for i, src in enumerate(files, 1):
         rgb = np.array(Image.open(src).convert("RGB"))
         hit = None if a.keep_logo else finder.find(rgb)
@@ -390,16 +516,31 @@ def main(argv=None) -> int:
             print(f"[{i}/{len(files)}] {tag}  {src.relative_to(a.src)}")
             continue
 
-        data, q, size = fit_webp(Image.fromarray(rgb), a.budget)
+        data, q, detail = fit_webp(Image.fromarray(rgb), a.budget)
         dst = a.out / src.relative_to(a.src).with_suffix(".webp")
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(data)
         if len(data) >= a.budget:
             over += 1
-        print(f"[{i}/{len(files)}] {len(data)/1024:6.1f}KB q={q:2d} {size[0]}x{size[1]}"
+        if detail < 1.0:
+            softened.append((str(dst.relative_to(a.out)), detail))
+        print(f"[{i}/{len(files)}] {len(data)/1024:6.1f}KB q={q:2d} {rgb.shape[1]}x{rgb.shape[0]}"
+              f" {'detail %3d%%' % round(detail * 100) if detail < 1.0 else '          '}"
               f" {'logo-removed' if hit else '           -'}  {dst.relative_to(a.out)}")
 
-    print(f"\n{len(files)} files, logo found in {found}" + ("" if a.dry_run else f", {over} over budget"))
+    if a.dry_run:
+        print(f"\n{len(files)} files, logo found in {found}")
+        return 0
+
+    print(f"\n{len(files)} files, logo found in {found}, {over} over budget, "
+          f"{len(softened)} needed detail dropped to fit")
+    harsh = sorted((d, n) for n, d in softened if d < BAD_DETAIL)
+    if harsh:
+        print(f"\n{len(harsh)} file(s) could only reach {a.budget // 1024} KB by losing most of"
+              f" their detail. At these pixel dimensions that budget is not really reachable --"
+              f" raise --budget for them, or let them be smaller images:")
+        for d, n in harsh:
+            print(f"  detail {round(d * 100):3d}%  {n}")
     return 0
 
 

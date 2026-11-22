@@ -43,15 +43,26 @@ sits immediately to the right of the logo.
 
 [LaMa](https://github.com/advimman/lama) via the TorchScript build published by
 [simple-lama-inpainting](https://github.com/enesmsahin/simple-lama-inpainting); the weights
-(~200 MB) are fetched to `assets/big-lama.pt` on first run. `--inpaint telea` falls back to
-OpenCV and needs no torch, but it smears visibly on detailed backgrounds — it is there so the
-pipeline still runs, not because it looks good.
+(~200 MB) are fetched to `assets/big-lama.pt` on first run.
+
+It runs on a window around the hole, scaled to ~512px, not on the whole poster. Handed a
+1535px frame at full size the model leaves small invented bright blobs in the fill; with the
+hole at a reasonable share of a 512px frame it does not. Everything outside the mask is copied
+through bit-exact.
+
+`--inpaint telea` falls back to OpenCV and needs no torch, but it smears visibly on detailed
+backgrounds — it is there so the pipeline still runs, not because it looks good.
 
 ### Hitting the size budget
 
-Binary search on WebP quality (30–95) for the largest value that still fits. Only if quality 30
-is still too big does it shrink the image by 15% and try again. Dimensions are preserved
-wherever quality alone can do the job.
+Pixel dimensions never change — the posters are cut to fixed sizes and stay that way.
+
+Binary search on WebP quality (1–95) for the highest value that still fits. That is enough for
+everything up to about 2 megapixels. A 3840×2160 hero banner cannot reach 100 KB on quality
+alone (even q=1 lands near 250 KB), so past that point detail is dropped instead: the image is
+scaled down and back up to its original size, in 20% steps, until a quality search fits. The
+file keeps its dimensions and gets softer. The log prints `detail NN%` for those, and the
+summary counts them — if too many show up, raise `--budget` rather than ship mush.
 
 ## Options
 
