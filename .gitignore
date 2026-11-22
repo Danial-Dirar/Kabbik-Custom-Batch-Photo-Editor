@@ -1,4 +1,8 @@
-output/
+# The processed WebPs in output/ are committed on purpose -- they are the deliverable.
+# Only the run's scratch state is not: it records absolute local paths.
+output/.kabbik-run.json
+output/.kabbik-run.json.tmp
+
 assets/big-lama.pt
 Current Task/
 __pycache__/
